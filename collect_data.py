@@ -14,6 +14,7 @@ class Args:
     save_path: str = "proposal_dataset.npz"
 
 args = tyro.cli(Args)
+last_print = time.time()
 
 # Get environment and training setup
 env = mbd_envs.get_env(args.env_name)
