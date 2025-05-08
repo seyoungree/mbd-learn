@@ -27,7 +27,7 @@ def progress_fn(num_steps, metrics):
         last_print = now
 
 # Choose training config based on env_name
-def train_fn(environment):
+def train_fn(environment, progress_fn=None):
     from brax.training.agents.sac.train import train as sac_train
     return sac_train(
         environment=environment,
@@ -43,14 +43,16 @@ def train_fn(environment):
         batch_size=512,
         grad_updates_per_step=64,
         seed=1,
+        progress_fn=progress_fn,
     )
 
 rng = jax.random.PRNGKey(seed=0)
 
 # Train the policy
 print("Start training")
+start_time = time.time()
 make_inference_fn, params, _ = train_fn(environment=env, progress_fn=progress_fn)
-print("Finished training")
+print(f"Finished training in {time.time()-start_time:.1f}s")
 inference_fn = make_inference_fn(params)
 jit_inference = jax.jit(inference_fn)
 jit_reset = jax.jit(env.reset)
