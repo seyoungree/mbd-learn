@@ -1,3 +1,4 @@
+import time
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -16,6 +17,14 @@ args = tyro.cli(Args)
 
 # Get environment and training setup
 env = mbd_envs.get_env(args.env_name)
+
+def progress_fn(num_steps, metrics):
+    global last_print
+    now = time.time()
+    if now - last_print > 5:  # print every 5 seconds
+        reward = metrics.get("eval/episode_reward", float('nan'))
+        print(f"[{num_steps} steps] Eval reward: {reward:.2f}")
+        last_print = now
 
 # Choose training config based on env_name
 def train_fn(environment):
@@ -40,7 +49,7 @@ rng = jax.random.PRNGKey(seed=0)
 
 # Train the policy
 print("Start training")
-make_inference_fn, params, _ = train_fn(environment=env)
+make_inference_fn, params, _ = train_fn(environment=env, progress_fn=progress_fn)
 print("Finished training")
 inference_fn = make_inference_fn(params)
 jit_inference = jax.jit(inference_fn)
