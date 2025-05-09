@@ -34,6 +34,71 @@ class Args:
     betaT: float = 1e-2  # final beta
     enable_demo: bool = False
 
+def improved_cosine_betas(T, beta0, betaT, gamma=0.5):
+    """
+    Implements the 'Improved Noise Schedule' from ICLR 2025.
+
+    Args:
+      T:         number of diffusion steps
+      beta0:     initial beta (small)
+      betaT:     final beta (larger)
+      gamma:     extra delay parameter in [0,1]
+    Returns:
+      betas:     shape (T,) array
+    """
+    t = jnp.arange(T + 1) / T  # [0, 1]
+    cos_norm = jnp.cos((gamma / (1 + gamma)) * (jnp.pi / 2)) ** 2
+    alpha_bar = (jnp.cos(((t + gamma) / (1 + gamma)) * (jnp.pi / 2)) ** 2) / cos_norm
+    alpha_bar = jnp.clip(alpha_bar, 1e-6, 1.0)
+    betas = 1.0 - (alpha_bar[1:] / alpha_bar[:-1])
+    betas = jnp.linspace(beta0, betaT, T) * 0 + betas
+    return jnp.clip(betas, 1e-6, 0.999)
+
+def cosine_beta_schedule(T: int, s: float = 0.0) -> jnp.ndarray:
+    """
+    Generate beta schedule from cosine noise schedule.
+    
+    Args:
+        T (int): Total number of timesteps.
+        s (float): Small offset to prevent singularity at t=0. Usually 0.008 for Improved DDPM, 0.0 for standard cosine.
+
+    Returns:
+        betas (jnp.ndarray): An array of beta_t values of shape (T,).
+    """
+    steps = jnp.arange(T + 1, dtype=jnp.float32)
+    f = lambda t: jnp.cos(((t / T + s) / (1 + s)) * jnp.pi / 2) ** 2
+    alpha_bars = f(steps)
+    alpha_bars = alpha_bars / alpha_bars[0]  # ensure alpha_bar[0] = 1.0
+    betas = 1 - (alpha_bars[1:] / alpha_bars[:-1])
+    betas = jnp.clip(betas, a_min=1e-8, a_max=0.999)
+    return betas
+
+def laplace_beta_schedule(T: int, mu: float = 0.5, b: float = 0.1) -> jnp.ndarray:
+    """
+    Generate a Laplace-based beta schedule.
+    - mu: center of the Laplace peak (in [0,1])
+    - b:  scale (smaller b → sharper peak)
+    """
+    # 1) define normalized timesteps u ∈ [0,1]
+    steps = jnp.arange(T + 1, dtype=jnp.float32) / T
+
+    # 2) Laplace PDF for each u
+    w = (1.0 / (2*b)) * jnp.exp(-jnp.abs(steps - mu) / b)
+
+    # 3) Cumulative integral of w(u) via trapezoid rule
+    #    so that ∫0^1 w(u)du = 1
+    cdf = jnp.concatenate([
+        jnp.array([0.0]),
+        jnp.cumsum((w[:-1] + w[1:]) * 0.5 * (1/T))
+    ])
+    cdf = cdf / cdf[-1]   # normalize to [0,1]
+
+    # 4) define alphā_t = 1 - cdf(t/T)
+    alpha_bar = 1.0 - cdf
+
+    # 5) compute betas
+    betas = 1.0 - (alpha_bar[1:] / alpha_bar[:-1])
+    return jnp.clip(betas, a_min=1e-8, a_max=0.999)
 
 def run_diffusion(args: Args):
 
@@ -70,6 +135,8 @@ def run_diffusion(args: Args):
     env = mbd.envs.get_env(args.env_name)
     Nx = env.observation_size
     Nu = env.action_size
+    print("Nx: ", Nx)
+    print("Nu: ", Nu)
     # env functions
     step_env_jit = jax.jit(env.step)
     reset_env_jit = jax.jit(env.reset)
@@ -81,10 +148,33 @@ def run_diffusion(args: Args):
 
     ## run diffusion
 
-    betas = jnp.linspace(args.beta0, args.betaT, args.Ndiffuse)
+    #linear
+    #betas = jnp.linspace(args.beta0, args.betaT, args.Ndiffuse)
+    #alphas = 1.0 - betas
+    #alphas_bar = jnp.cumprod(alphas)
+    #sigmas = jnp.sqrt(1 - alphas_bar)
+
+    #standard cosine
+    # betas = cosine_beta_schedule(args.Ndiffuse)  # no beta0 or betaT needed
+    # alphas = 1.0 - betas
+    # alphas_bar = jnp.cumprod(alphas)
+    # sigmas = jnp.sqrt(1 - alphas_bar)
+
+    #0.7: 1.32e+00
+    #updated cosine
+    gamma = 0
+    betas = improved_cosine_betas(args.Ndiffuse, args.beta0, args.betaT, gamma)
     alphas = 1.0 - betas
     alphas_bar = jnp.cumprod(alphas)
     sigmas = jnp.sqrt(1 - alphas_bar)
+
+    #laplace
+    # betas = laplace_beta_schedule(args.Ndiffuse, mu=0.5, b=0.3)
+    # alphas     = 1.0 - betas
+    # alphas_bar = jnp.cumprod(alphas)
+    # sigmas     = jnp.sqrt(1 - alphas_bar)
+
+    
     Sigmas_cond = (
         (1 - alphas) * (1 - jnp.sqrt(jnp.roll(alphas_bar, 1))) / (1 - alphas_bar)
     )
