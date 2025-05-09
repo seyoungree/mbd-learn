@@ -45,7 +45,7 @@ class ConditionalProposalNet(nn.Module):
 
         return x.reshape((B, self.H, self.d))
 
-    
+
 @dataclass
 class Args:
     seed: int = 0
@@ -59,6 +59,73 @@ class Args:
     beta0: float = 1e-4
     betaT: float = 1e-2
     enable_demo: bool = False
+
+def improved_cosine_betas(T, beta0, betaT, gamma=0.5):
+    """
+    Implements the 'Improved Noise Schedule' from ICLR 2025.
+
+    Args:
+      T:         number of diffusion steps
+      beta0:     initial beta (small)
+      betaT:     final beta (larger)
+      gamma:     extra delay parameter in [0,1]
+    Returns:
+      betas:     shape (T,) array
+    """
+    t = jnp.arange(T + 1) / T  # [0, 1]
+    cos_norm = jnp.cos((gamma / (1 + gamma)) * (jnp.pi / 2)) ** 2
+    alpha_bar = (jnp.cos(((t + gamma) / (1 + gamma)) * (jnp.pi / 2)) ** 2) / cos_norm
+    alpha_bar = jnp.clip(alpha_bar, 1e-6, 1.0)
+    betas = 1.0 - (alpha_bar[1:] / alpha_bar[:-1])
+    betas = jnp.linspace(beta0, betaT, T) * 0 + betas
+    return jnp.clip(betas, 1e-6, 0.999)
+
+def cosine_beta_schedule(T: int, s: float = 0.0) -> jnp.ndarray:
+    """
+    Generate beta schedule from cosine noise schedule.
+    
+    Args:
+        T (int): Total number of timesteps.
+        s (float): Small offset to prevent singularity at t=0. Usually 0.008 for Improved DDPM, 0.0 for standard cosine.
+
+    Returns:
+        betas (jnp.ndarray): An array of beta_t values of shape (T,).
+    """
+    steps = jnp.arange(T + 1, dtype=jnp.float32)
+    f = lambda t: jnp.cos(((t / T + s) / (1 + s)) * jnp.pi / 2) ** 2
+    alpha_bars = f(steps)
+    alpha_bars = alpha_bars / alpha_bars[0]  # ensure alpha_bar[0] = 1.0
+    betas = 1 - (alpha_bars[1:] / alpha_bars[:-1])
+    betas = jnp.clip(betas, a_min=1e-8, a_max=0.999)
+    return betas
+
+def laplace_beta_schedule(T: int, mu: float = 0.5, b: float = 0.1) -> jnp.ndarray:
+    """
+    Generate a Laplace-based beta schedule.
+    - mu: center of the Laplace peak (in [0,1])
+    - b:  scale (smaller b → sharper peak)
+    """
+    # 1) define normalized timesteps u ∈ [0,1]
+    steps = jnp.arange(T + 1, dtype=jnp.float32) / T
+
+    # 2) Laplace PDF for each u
+    w = (1.0 / (2*b)) * jnp.exp(-jnp.abs(steps - mu) / b)
+
+    # 3) Cumulative integral of w(u) via trapezoid rule
+    #    so that ∫0^1 w(u)du = 1
+    cdf = jnp.concatenate([
+        jnp.array([0.0]),
+        jnp.cumsum((w[:-1] + w[1:]) * 0.5 * (1/T))
+    ])
+    cdf = cdf / cdf[-1]   # normalize to [0,1]
+
+    # 4) define alphā_t = 1 - cdf(t/T)
+    alpha_bar = 1.0 - cdf
+
+    # 5) compute betas
+    betas = 1.0 - (alpha_bar[1:] / alpha_bar[:-1])
+    return jnp.clip(betas, a_min=1e-8, a_max=0.999)
+
 
 def run_diffusion(args: Args):
     rng = jax.random.PRNGKey(seed=args.seed)
@@ -120,14 +187,22 @@ def run_diffusion(args: Args):
 
         rng, noise_rng = jax.random.split(rng)
 
-        # Proposal-based sampling
-        Yi_input = Yi[None, :, :]  # (1, H, d)
-        ctx_input = dummy_context[None, :]  # (1, ctx_dim)
-        t_input = jnp.array([i], dtype=jnp.int32)  # (1,)
+        def proposal_sampling(_):
+            Yi_input = Yi[None, :, :]
+            ctx_input = dummy_context[None, :]
+            t_input = jnp.array([i], dtype=jnp.int32)
+            Y0_pred = proposal_apply_fn(proposal_params, Yi_input, ctx_input, t_input)
+            return jnp.repeat(Y0_pred, args.Nsample, axis=0)
 
-        # Single proposal prediction
-        Y0_pred = proposal_apply_fn(proposal_params, Yi_input, ctx_input, t_input)  # (1, H, d)
-        Y0s = jnp.repeat(Y0_pred, args.Nsample, axis=0)  # (Nsample, H, d)
+        def noise_sampling(_):
+            return jnp.repeat(Yi[None, :, :], args.Nsample, axis=0)
+
+        Y0s = jax.lax.cond(
+            i == (args.Ndiffuse - 1),
+            proposal_sampling,
+            noise_sampling,
+            operand=None
+        )
 
         noise = jax.random.normal(noise_rng, Y0s.shape)
         Y0s = Y0s + sigmas[i] * noise
